@@ -3,3 +3,6 @@
 "mysql","3306","tcp"
 "rdp","3389","tcp"
 "ssh","22","tcp"
+"grouper","1433","tcp"
+"grouper","3306","tcp"
+"grouper","22","tcp"
