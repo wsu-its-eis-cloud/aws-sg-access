@@ -15,7 +15,7 @@ param(
     [string] $serviceIdTagName = "service-id",
 
     [Alias("a")]
-    [string] $applicationName = "",
+    [string[]] $applicationNames = @(),
 
     [Alias("pi")]
     [switch] $publicIp = $false,
@@ -100,10 +100,10 @@ if ($serviceIdTagName -eq "") {
 $serviceIdTagName = $serviceIdTagName.ToLower()
 
 # Prompt for name if not specified
-if ($applicationName -eq "") {
-	$applicationName = Read-Host "Enter the name of the application"
+if ($applicationNames -eq "") {
+	$applicationNames = Read-Host "Enter the name of the application"
 }
-$applicationName = $applicationName.ToLower()
+$applicationNames = $applicationNames.ToLower()
 
 # Check for public IP
 $ipAddresses = @()
@@ -129,6 +129,7 @@ if($debug) {
     $serviceFamilyTagName
     $serviceId
     $serviceIdTagName
+	$applicationNames
 }
 
 # Retrieve specified AWS STS session
@@ -178,77 +179,80 @@ $hash = @{Key="management-task-data"; Value=("{0}" -f [DateTimeOffset]::Now.AddH
 $managementData = [PSCustomObject]$hash
 Write-Debug $managementData
 
-Write-Debug "`t Building tag filters and retrieving tags..."
-$filters = @()
-$filter = New-Object -TypeName Amazon.EC2.Model.Filter
-$filter.Name = "resource-type"
-$filter.Values.Add("security-group")
-$filters += $filter
+foreach($applicationName in $applicationNames) {
+	Write-Debug "`t Building tag filters and retrieving tags..."
+	$filters = @()
+	$filter = New-Object -TypeName Amazon.EC2.Model.Filter
+	$filter.Name = "resource-type"
+	$filter.Values.Add("security-group")
+	$filters += $filter
 
-$filter = New-Object -TypeName Amazon.EC2.Model.Filter
-$filter.Name = "tag:application"
-$filter.Values.Add($applicationName)
-$filters += $filter
-$securityGroupTags = Get-EC2Tag -Filter $filters @session
+	$filter = New-Object -TypeName Amazon.EC2.Model.Filter
+	$filter.Name = "tag:application"
+	$filter.Values.Add($applicationName)
+	$filters += $filter
+	$securityGroupTags = Get-EC2Tag -Filter $filters @session
 
-$filter = New-Object -TypeName Amazon.EC2.Model.Filter
-$filter.Name = ("tag:{0}" -f $serviceFamilyTagName)
-$filter.Values.Add($serviceFamily)
-$serviceFamilyTags = Get-EC2Tag -Filter $filter @session
+	$filter = New-Object -TypeName Amazon.EC2.Model.Filter
+	$filter.Name = ("tag:{0}" -f $serviceFamilyTagName)
+	$filter.Values.Add($serviceFamily)
+	$serviceFamilyTags = Get-EC2Tag -Filter $filter @session
 
-$filter = New-Object -TypeName Amazon.EC2.Model.Filter
-$filter.Name = ("tag:{0}" -f $serviceIdTagName)
-$filter.Values.Add($serviceId)
-$serviceIdTags = Get-EC2Tag -Filter $filter @session
+	$filter = New-Object -TypeName Amazon.EC2.Model.Filter
+	$filter.Name = ("tag:{0}" -f $serviceIdTagName)
+	$filter.Values.Add($serviceId)
+	$serviceIdTags = Get-EC2Tag -Filter $filter @session
 
-if($securityGroupTags -eq $null -or $serviceFamilyTags -eq $null -or $serviceIdTags -eq $null) {
-    Write-Debug "`t No security group matches all necessary criteria."
-    if($debug){Stop-Transcript}
-    return
+	if($securityGroupTags -eq $null -or $serviceFamilyTags -eq $null -or $serviceIdTags -eq $null) {
+		Write-Debug "`t No security group matches all necessary criteria."
+		if($debug){Stop-Transcript}
+		return
+	}
+
+	Write-Debug "`t Creating management-task instructions..."
+	$managementTaskHash = @{"management-task"="delete"; data=("{0}" -f [DateTimeOffset]::Now.AddHours(12).ToUnixTimeSeconds())}
+	$managementTask = [PSCustomObject]$managementTaskHash
+	$managementTask = ($managementTask | ConvertTo-Json -Depth 5 -Compress)
+
+	Write-Debug "`t Verifying resource ID's match across all filters..."
+	foreach($sgt in $securityGroupTags) {
+		$sg = $null
+		if($serviceFamilyTags.ResourceId.Contains($sgt.ResourceId) -and $serviceIdTags.ResourceId.Contains($sgt.ResourceId)) {
+			$sg = (Get-EC2SecurityGroup -GroupId $securityGroupTags.ResourceId @session)
+		}
+
+		if($sg -eq $null) {
+			Write-Debug "`t Mismatch of sg ID's across tag searches"
+		} else {
+			Import-Csv WSU_ServicePorts.csv | ForEach-Object {
+				if($_.ApplicationName -eq $applicationName) {
+					foreach($ip in $ipAddresses) {
+						$ipRange = New-Object -TypeName Amazon.EC2.Model.IpRange
+						$ipRange.CidrIp = ("{0}/32" -f $ip)
+						$ipRange.Description = ("json={0}" -f [System.Web.HttpUtility]::HtmlEncode($managementTask))
+						Write-Debug $ipRange
+
+						Write-Debug "`t Building security group ingress rule..."
+						$ipPermission = New-Object -TypeName Amazon.EC2.Model.IpPermission
+						$ipPermission.FromPort = $_.ApplicationPort
+						$ipPermission.IpProtocol = $_.ApplicationProtocol
+						$ipPermission.Ipv4Ranges = $ipRange
+						$ipPermission.ToPort = $_.ApplicationPort
+						Write-Debug $ipPermission
+
+						Write-Debug "`t Applying ingress rules..."
+						try{
+							Grant-EC2SecurityGroupIngress -GroupId $sg.GroupId -IpPermission $ipPermission @session
+						} catch {
+							Write-Debug "`t Rule already exists."
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
-Write-Debug "`t Creating management-task instructions..."
-$managementTaskHash = @{"management-task"="delete"; data=("{0}" -f [DateTimeOffset]::Now.AddHours(12).ToUnixTimeSeconds())}
-$managementTask = [PSCustomObject]$managementTaskHash
-$managementTask = ($managementTask | ConvertTo-Json -Depth 5 -Compress)
-
-Write-Debug "`t Verifying resource ID's match across all filters..."
-foreach($sgt in $securityGroupTags) {
-    $sg = $null
-    if($serviceFamilyTags.ResourceId.Contains($sgt.ResourceId) -and $serviceIdTags.ResourceId.Contains($sgt.ResourceId)) {
-        $sg = (Get-EC2SecurityGroup -GroupId $securityGroupTags.ResourceId @session)
-    }
-
-    if($sg -eq $null) {
-        Write-Debug "`t Mismatch of sg ID's across tag searches"
-    } else {
-        Import-Csv WSU_ServicePorts.csv | ForEach-Object {
-	        if($_.ApplicationName -eq $applicationName) {
-                foreach($ip in $ipAddresses) {
-                    $ipRange = New-Object -TypeName Amazon.EC2.Model.IpRange
-                    $ipRange.CidrIp = ("{0}/32" -f $ip)
-                    $ipRange.Description = ("json={0}" -f [System.Web.HttpUtility]::HtmlEncode($managementTask))
-                    Write-Debug $ipRange
-
-                    Write-Debug "`t Building security group ingress rule..."
-                    $ipPermission = New-Object -TypeName Amazon.EC2.Model.IpPermission
-                    $ipPermission.FromPort = $_.ApplicationPort
-                    $ipPermission.IpProtocol = $_.ApplicationProtocol
-                    $ipPermission.Ipv4Ranges = $ipRange
-                    $ipPermission.ToPort = $_.ApplicationPort
-                    Write-Debug $ipPermission
-
-                    Write-Debug "`t Applying ingress rules..."
-                    try{
-                        Grant-EC2SecurityGroupIngress -GroupId $sg.GroupId -IpPermission $ipPermission @session
-                    } catch {
-                        Write-Debug "`t Rule already exists."
-                    }
-                }
-	        }
-        }
-    }
-}
 
 if($debug) {
     Stop-Transcript
